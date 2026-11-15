@@ -2,7 +2,9 @@ package io.github.nomisrev.kafka.publisher
 
 import io.github.nomisRev.kafka.publisher.produce
 import io.github.nomisRev.kafka.publisher.produceOrThrow
+import io.github.nomisrev.kafka.Boom
 import io.github.nomisrev.kafka.KafkaSpec
+import io.kotest.matchers.shouldBe
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -16,180 +18,185 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.toList
 import org.apache.kafka.clients.producer.RecordMetadata
-import org.junit.jupiter.api.Test
-import kotlin.test.Ignore
-import kotlin.test.assertEquals
 
-class FlowProduceSpec : KafkaSpec() {
-  @Test
-  fun `produce - All offered messages are received`() = withTopic {
-    val count = 10_000
-    val records = produce(count)
-      .asFlow()
-      .flowOn(Dispatchers.IO)
+class FlowProduceSpec : KafkaSpec({
+  test("produce - All offered messages are received") {
+    withTopic {
+      val count = 10_000
+      val records = produce(count)
+        .asFlow()
+        .flowOn(Dispatchers.IO)
 
-    records
-      .produce(publisherSettings())
-      .flowOn(Dispatchers.Default)
-      .collect()
-
-    topic.assertHasRecords(records.toList())
-  }
-
-  @Test
-  fun `produce - Failure does not stop previous send messages`() = withTopic {
-    var count = 0
-    val records = produce(10)
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
-      .append { throw Boom }
-
-    val e = runCatching {
-      flow
+      records
         .produce(publisherSettings())
         .flowOn(Dispatchers.Default)
-        .onEach { count++ }
         .collect()
-    }.exceptionOrNull()
 
-    assertEquals(records.size, count)
-    assertEquals(Boom, e)
-    topic.assertHasRecords(records)
+      topic.assertHasRecords(records.toList())
+    }
   }
 
-  @Test
-  fun `produce - Can handle exception from upstream`() = withTopic {
-    val records = produce(0..4)
-    val records2 = produce(5..10)
-    val allRecords = records + records2
+  test("produce - Failure does not stop previous send messages") {
+    withTopic {
+      var count = 0
+      val records = produce(10)
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
+        .append { throw Boom }
 
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
-      .append { throw Boom }
-      .catch { emitAll(records2) }
+      val e = runCatching {
+        flow
+          .produce(publisherSettings())
+          .flowOn(Dispatchers.Default)
+          .onEach { count++ }
+          .collect()
+      }.exceptionOrNull()
 
-    val count = flow
-      .produce(publisherSettings())
-      .flowOn(Dispatchers.Default)
-      .toList()
-
-    assertEquals(allRecords.size, count.size)
-    topic.assertHasRecords(allRecords)
+      count shouldBe records.size
+      e shouldBe Boom
+      topic.assertHasRecords(records)
+    }
   }
 
-  @Test
-  fun `produce - Can handle exception from producer`() = withTopic {
-    val buffer = mutableListOf<Result<RecordMetadata>>()
-    val records = produce(10)
+  test("produce - Can handle exception from upstream") {
+    withTopic {
+      val records = produce(0..4)
+      val records2 = produce(5..10)
+      val allRecords = records + records2
 
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
+        .append { throw Boom }
+        .catch { emitAll(records2) }
 
-    val result = runCatching {
+      val count = flow
+        .produce(publisherSettings())
+        .flowOn(Dispatchers.Default)
+        .toList()
+
+      count.size shouldBe allRecords.size
+      topic.assertHasRecords(allRecords)
+    }
+  }
+
+  test("produce - Can handle exception from producer") {
+    withTopic {
+      val buffer = mutableListOf<Result<RecordMetadata>>()
+      val records = produce(10)
+
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
+
+      val result = runCatching {
+        flow
+          .produce(publisherSettings().copy(createProducer = stubProducer(failOnNumber = 5)))
+          .flowOn(Dispatchers.Default)
+          .onEach { buffer.add(it) }
+          .collect()
+      }
+
+      buffer.size shouldBe records.size
+      buffer.count { it.isFailure } shouldBe 1
+      result.exceptionOrNull() shouldBe Boom
+      topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
+    }
+  }
+
+  test("produce - Can catch exception from producer") {
+    withTopic {
+      val error = CompletableDeferred<Throwable>()
+      val records = produce(10)
+
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
+
       flow
         .produce(publisherSettings().copy(createProducer = stubProducer(failOnNumber = 5)))
+        .catch { require(error.complete(it)) { "Only 1 error expected." } }
         .flowOn(Dispatchers.Default)
-        .onEach { buffer.add(it) }
-        .collect()
+        .toList()
+
+      error.await() shouldBe Boom
+      topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
     }
-
-    assertEquals(records.size, buffer.size)
-    assertEquals(buffer.count { it.isFailure }, 1)
-    assertEquals(result.exceptionOrNull(), Boom)
-    topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
   }
 
-  @Test
-  fun `produce - Can catch exception from producer`() = withTopic {
-    val error = CompletableDeferred<Throwable>()
-    val records = produce(10)
+  test("produceOrThrow - All offered messages are received") {
+    withTopic {
+      val records = produce(10)
+        .asFlow()
+        .flowOn(Dispatchers.IO)
 
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
-
-    flow
-      .produce(publisherSettings().copy(createProducer = stubProducer(failOnNumber = 5)))
-      .catch { require(error.complete(it)) { "Only 1 error expected." } }
-      .flowOn(Dispatchers.Default)
-      .toList()
-
-    assertEquals(Boom, error.await())
-    topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
-  }
-
-  @Test
-  fun `produceOrThrow - All offered messages are received`() = withTopic {
-    val records = produce(10)
-      .asFlow()
-      .flowOn(Dispatchers.IO)
-
-    records
-      .produceOrThrow(publisherSettings())
-      .flowOn(Dispatchers.Default)
-      .collect()
-
-    topic.assertHasRecords(records.toList())
-  }
-
-  @Test
-  fun `produceOrThrow - Failure does not stop previous send messages`() = withTopic {
-    val records = produce(10)
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
-      .append { throw Boom }
-
-    val result = runCatching {
-      flow
+      records
         .produceOrThrow(publisherSettings())
         .flowOn(Dispatchers.Default)
         .collect()
+
+      topic.assertHasRecords(records.toList())
     }
-
-    assertEquals(Boom, result.exceptionOrNull())
-    topic.assertHasRecords(records)
   }
 
-  @Test
-  fun `produceOrThrow - Can catch exception from producer`() = withTopic {
-    val error = CompletableDeferred<Throwable>()
-    val records = produce(10)
+  test("produceOrThrow - Failure does not stop previous send messages") {
+    withTopic {
+      val records = produce(10)
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
+        .append { throw Boom }
 
-    val flow = records
-      .asFlow()
-      .flowOn(Dispatchers.IO)
+      val result = runCatching {
+        flow
+          .produceOrThrow(publisherSettings())
+          .flowOn(Dispatchers.Default)
+          .collect()
+      }
 
-    flow
-      .produceOrThrow(publisherSettings().copy(createProducer = stubProducer(failOnNumber = 5)))
-      .catch { require(error.complete(it)) { "Only 1 error expected." } }
-      .flowOn(Dispatchers.Default)
-      .toList()
-
-    assertEquals(Boom, error.await())
-    topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
+      result.exceptionOrNull() shouldBe Boom
+      topic.assertHasRecords(records)
+    }
   }
 
-  @Test
-  @Ignore
-  fun stressSlow() = withTopic {
-    val records = produce(10)
+  test("produceOrThrow - Can catch exception from producer") {
+    withTopic {
+      val error = CompletableDeferred<Throwable>()
+      val records = produce(10)
 
-    val flow = records.asFlow()
-      .onEach { delay(25_000) }
-      .flowOn(Dispatchers.IO)
+      val flow = records
+        .asFlow()
+        .flowOn(Dispatchers.IO)
 
-    flow
-      .produce(publisherSettings())
-      .flowOn(Dispatchers.Default)
-      .collect()
+      flow
+        .produceOrThrow(publisherSettings().copy(createProducer = stubProducer(failOnNumber = 5)))
+        .catch { require(error.complete(it)) { "Only 1 error expected." } }
+        .flowOn(Dispatchers.Default)
+        .toList()
 
-    topic.assertHasRecords(records)
+      error.await() shouldBe Boom
+      topic.assertHasRecords(records.toMutableList().apply { removeAt(5) })
+    }
   }
-}
+
+  xtest("stressSlow") {
+    withTopic {
+      val records = produce(10)
+
+      val flow = records.asFlow()
+        .onEach { delay(25_000) }
+        .flowOn(Dispatchers.IO)
+
+      flow
+        .produce(publisherSettings())
+        .flowOn(Dispatchers.Default)
+        .collect()
+
+      topic.assertHasRecords(records)
+    }
+  }
+})
 
 private suspend fun <T> FlowCollector<T>.emitAll(iterable: Iterable<T>) =
   iterable.forEach { emit(it) }

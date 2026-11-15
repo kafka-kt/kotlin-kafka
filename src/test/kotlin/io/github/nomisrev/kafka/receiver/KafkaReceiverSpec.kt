@@ -2,8 +2,10 @@ package io.github.nomisrev.kafka.receiver
 
 import io.github.nomisRev.kafka.receiver.CommitStrategy
 import io.github.nomisRev.kafka.receiver.KafkaReceiver
+import io.github.nomisrev.kafka.Boom
 import io.github.nomisrev.kafka.KafkaSpec
-import io.github.nomisrev.kafka.assertThrows
+import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.matchers.shouldBe
 import io.github.nomisrev.kafka.mapIndexed
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -25,13 +27,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
-import org.junit.jupiter.api.Test
-import kotlin.test.assertEquals
 
 data class KeyValue(val key: String, val value: String)
 
 @ExperimentalCoroutinesApi
-class KafkaReceiverSpec : KafkaSpec() {
+class KafkaReceiverSpec : KafkaSpec({
   val count = 1000
   val lastIndex = count - 1
   fun produced(
@@ -42,10 +42,9 @@ class KafkaReceiverSpec : KafkaSpec() {
 
   val produced = produced()
 
-  @Test
-  fun `All produced records are received`() = withTopic {
-    publishToKafka(topic, produced)
-    assertEquals(
+  test("All produced records are received") {
+    withTopic {
+      publishToKafka(topic, produced)
       KafkaReceiver()
         .receive(topic.name())
         .map { record ->
@@ -53,53 +52,48 @@ class KafkaReceiverSpec : KafkaSpec() {
           KeyValue(record.key(), record.value())
             .also { record.offset.acknowledge() }
         }.take(count)
-        .toSet(),
-      produced.toSet()
-    )
+        .toSet() shouldBe produced.toSet()
+    }
   }
 
-  @Test
-  fun `All records produced while consuming are received`() = withTopic {
-    launch { publishToKafka(topic, produced) }
-    assertEquals(
+  test("All records produced while consuming are received") {
+    withTopic {
+      launch { publishToKafka(topic, produced) }
       KafkaReceiver()
         .receive(topic.name())
         .map { record ->
           KeyValue(record.key(), record.value())
             .also { record.offset.acknowledge() }
         }.take(count)
-        .toSet(),
-      produced.toSet()
-    )
+        .toSet() shouldBe produced.toSet()
+    }
   }
 
-  @Test
-  fun `Continuous receiving does not overflow stack`() = withTopic {
-    val largeCount = 20_000 // when it _was_ overflowing stack, it only took ~4095 messages.
-    publishScope {
-      repeat(largeCount) {
-        offer(ProducerRecord(topic.name(), "key-$it", "value-$it"))
+  test("Continuous receiving does not overflow stack") {
+    withTopic {
+      val largeCount = 20_000 // when it _was_ overflowing stack, it only took ~4095 messages.
+      publishScope {
+        repeat(largeCount) {
+          offer(ProducerRecord(topic.name(), "key-$it", "value-$it"))
+        }
       }
-    }
-    val settings = receiverSetting().copy(
-      maxDeferredCommits = largeCount + 1,
-      commitStrategy = CommitStrategy.BySize(largeCount + 1),
-      properties = mapOf(ConsumerConfig.MAX_POLL_RECORDS_CONFIG to "1").toProperties()
-    )
-    assertEquals(
+      val settings = receiverSetting().copy(
+        maxDeferredCommits = largeCount + 1,
+        commitStrategy = CommitStrategy.BySize(largeCount + 1),
+        properties = mapOf(ConsumerConfig.MAX_POLL_RECORDS_CONFIG to "1").toProperties()
+      )
       KafkaReceiver(settings)
         .receive(topic.name())
         .buffer(largeCount)
         .take(largeCount)
-        .count(),
-      largeCount
-    )
+        .onEach { it.offset.acknowledge() }
+        .count() shouldBe largeCount
+    }
   }
 
-  @Test
-  fun `Can consume after backpressure`() = withTopic {
-    publishToKafka(topic, produced)
-    assertEquals(
+  test("Can consume after backpressure") {
+    withTopic {
+      publishToKafka(topic, produced)
       KafkaReceiver()
         .receive(topic.name())
         .map { record ->
@@ -107,194 +101,197 @@ class KafkaReceiverSpec : KafkaSpec() {
           KeyValue(record.key(), record.value())
             .also { record.offset.acknowledge() }
         }.take(count)
-        .toSet(),
-      produced.toSet()
-    )
-  }
-
-  @Test
-  fun `Concurrent commits while receiving`() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver(
-      receiverSetting().copy(
-        commitStrategy = CommitStrategy.BySize(count / 2)
-      )
-    )
-    receiver.receive(topic.name())
-      .take(count)
-      .collect { it.offset.acknowledge() }
-
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
-  }
-
-  @Test
-  fun `All produced records with headers are received`() = withTopic(partitions = 1) {
-    val producerRecords = produced.map { (key, value) ->
-      ProducerRecord(topic.name(), key, value).apply {
-        headers().add("header1", byteArrayOf(0.toByte()))
-        headers().add("header2", value.toByteArray())
-      }
+        .toSet() shouldBe produced.toSet()
     }
-
-    publishToKafka(producerRecords)
-
-    val _ = KafkaReceiver()
-      .receive(topic.name())
-      .take(count)
-      .onEach { it.offset.acknowledge() }
-      .toList()
-      .zip(producerRecords) { actual, expected ->
-        assertEquals(actual.key(), expected.key())
-        assertEquals(actual.value(), expected.value())
-        assertEquals(actual.topic(), topic.name())
-        assertEquals(actual.headers().toArray().size, 2)
-        assertEquals(actual.headers(), expected.headers())
-      }
   }
 
-  @Test
-  fun `Should receive all records when subscribing several consumers`() = withTopic {
-    publishToKafka(topic, produced)
-    val consumer =
-      KafkaReceiver()
-        .receive(topic.name())
-        .map {
-          yield()
-          KeyValue(it.key(), it.value())
-        }
+  test("Concurrent commits while receiving") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver(
+        receiverSetting().copy(
+          commitStrategy = CommitStrategy.BySize(count / 2)
+        )
+      )
+      receiver.receive(topic.name())
+        .take(count)
+        .collect { it.offset.acknowledge() }
 
-    assertEquals(
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
+    }
+  }
+
+  test("All produced records with headers are received") {
+    withTopic(partitions = 1) {
+      val producerRecords = produced.map { (key, value) ->
+        ProducerRecord(topic.name(), key, value).apply {
+          headers().add("header1", byteArrayOf(0.toByte()))
+          headers().add("header2", value.toByteArray())
+        }
+      }
+
+      publishToKafka(producerRecords)
+
+      val _ = KafkaReceiver()
+        .receive(topic.name())
+        .take(count)
+        .onEach { it.offset.acknowledge() }
+        .toList()
+        .zip(producerRecords) { actual, expected ->
+          actual.key() shouldBe expected.key()
+          actual.value() shouldBe expected.value()
+          actual.topic() shouldBe topic.name()
+          actual.headers().toArray().size shouldBe 2
+          actual.headers() shouldBe expected.headers()
+        }
+    }
+  }
+
+  test("Should receive all records when subscribing several consumers") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val consumer =
+        KafkaReceiver()
+          .receive(topic.name())
+          .map {
+            yield()
+            KeyValue(it.key(), it.value())
+              .also { _ -> it.offset.acknowledge() }
+          }
+
       flowOf(consumer, consumer)
         .flattenMerge()
         .take(count)
-        .toSet(),
-      produced.toSet()
-    )
+        .toSet() shouldBe produced.toSet()
+    }
   }
 
-  @Test
-  fun `All acknowledged messages are committed on flow completion`() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver(
-      receiverSetting().copy(
-        commitStrategy = CommitStrategy.BySize(2 * count)
+  test("All acknowledged messages are committed on flow completion") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver(
+        receiverSetting().copy(
+          commitStrategy = CommitStrategy.BySize(2 * count)
+        )
       )
-    )
-    receiver.receive(topic.name())
-      .take(count)
-      .collectIndexed { index, value ->
-        if (index == lastIndex) {
-          value.offset.acknowledge()
-          assertEquals(receiver.committedCount(topic.name()), 0)
-        } else value.offset.acknowledge()
-      }
-
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
-  }
-
-  @Test
-  fun `All acknowledged messages are committed on flow failure`() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver(
-      receiverSetting().copy(
-        commitStrategy = CommitStrategy.BySize(2 * count)
-      )
-    )
-    val exception = assertThrows<RuntimeException> {
       receiver.receive(topic.name())
+        .take(count)
         .collectIndexed { index, value ->
           if (index == lastIndex) {
             value.offset.acknowledge()
-            assertEquals(receiver.committedCount(topic.name()), 0)
-            throw Boom
+            receiver.committedCount(topic.name()) shouldBe 0
+          } else value.offset.acknowledge()
+        }
+
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
+    }
+  }
+
+  test("All acknowledged messages are committed on flow failure") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver(
+        receiverSetting().copy(
+          commitStrategy = CommitStrategy.BySize(2 * count)
+        )
+      )
+      val exception = shouldThrow<RuntimeException> {
+        receiver.receive(topic.name())
+          .collectIndexed { index, value ->
+            if (index == lastIndex) {
+              value.offset.acknowledge()
+              receiver.committedCount(topic.name()) shouldBe 0
+              throw Boom
+            } else value.offset.acknowledge()
+          }
+      }
+
+      exception shouldBe Boom
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
+    }
+  }
+
+  test("All acknowledged messages are committed on flow cancellation") {
+    withTopic {
+      val scope = this
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver(
+        receiverSetting().copy(
+          commitStrategy = CommitStrategy.BySize(2 * count)
+        )
+      )
+      val latch = CompletableDeferred<Unit>()
+      val job = receiver.receive(topic.name())
+        .mapIndexed { index, value ->
+          if (index == lastIndex) {
+            value.offset.acknowledge()
+            receiver.committedCount(topic.name()) shouldBe 0
+            require(latch.complete(Unit)) { "Latch completed twice" }
+          } else value.offset.acknowledge()
+        }.launchIn(scope)
+
+      latch.await()
+      job.cancelAndJoin()
+
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
+    }
+  }
+
+  test("Manual commit also commits all acknowledged offsets") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver(
+        receiverSetting().copy(
+          commitStrategy = CommitStrategy.BySize(2 * count)
+        )
+      )
+      receiver.receive(topic.name())
+        .take(count)
+        .collectIndexed { index, value ->
+          if (index == lastIndex) {
+            value.offset.commit()
+            receiver.committedCount(topic.name()) shouldBe count.toLong()
           } else value.offset.acknowledge()
         }
     }
-
-    assertEquals(exception, Boom)
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
   }
 
-  @Test
-  fun `All acknowledged messages are committed on flow cancellation`() = withTopic {
-    val scope = this
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver(
-      receiverSetting().copy(
-        commitStrategy = CommitStrategy.BySize(2 * count)
-      )
-    )
-    val latch = CompletableDeferred<Unit>()
-    val job = receiver.receive(topic.name())
-      .mapIndexed { index, value ->
-        if (index == lastIndex) {
-          value.offset.acknowledge()
-          assertEquals(receiver.committedCount(topic.name()), 0)
-          require(latch.complete(Unit)) { "Latch completed twice" }
-        } else value.offset.acknowledge()
-      }.launchIn(scope)
+  test("receiveAutoAck") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver()
 
-    latch.await()
-    job.cancelAndJoin()
+      receiver.receiveAutoAck(topic.name())
+        .flattenConcat()
+        .take(count)
+        .collect()
 
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
+    }
   }
 
-  @Test
-  fun `Manual commit also commits all acknowledged offsets`() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver(
-      receiverSetting().copy(
-        commitStrategy = CommitStrategy.BySize(2 * count)
-      )
-    )
-    receiver.receive(topic.name())
-      .take(count)
-      .collectIndexed { index, value ->
-        if (index == lastIndex) {
-          value.offset.commit()
-          assertEquals(receiver.committedCount(topic.name()), count.toLong())
-        } else value.offset.acknowledge()
-      }
-  }
+  test("receiveAutoAck does not receive same records") {
+    withTopic {
+      publishToKafka(topic, produced)
+      val receiver = KafkaReceiver()
 
-  @Test
-  fun receiveAutoAck() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver()
+      receiver.receiveAutoAck(topic.name())
+        .flattenConcat()
+        .take(count)
+        .collect()
 
-    receiver.receiveAutoAck(topic.name())
-      .flattenConcat()
-      .take(count)
-      .collect()
+      receiver.committedCount(topic.name()) shouldBe count.toLong()
 
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
-  }
+      val seconds = produced(count + 1, count + 1 + count)
+      publishToKafka(topic, seconds)
 
-  @Test
-  fun `receiveAutoAck does not receive same records`() = withTopic {
-    publishToKafka(topic, produced)
-    val receiver = KafkaReceiver()
-
-    receiver.receiveAutoAck(topic.name())
-      .flattenConcat()
-      .take(count)
-      .collect()
-
-    assertEquals(receiver.committedCount(topic.name()), count.toLong())
-
-    val seconds = produced(count + 1, count + 1 + count)
-    publishToKafka(topic, seconds)
-
-    assertEquals(
       receiver.receiveAutoAck(topic.name())
         .flattenConcat()
         .map { KeyValue(it.key(), it.value()) }
         .take(count)
-        .toSet(),
-      seconds.toSet()
-    )
+        .toSet() shouldBe seconds.toSet()
 
-    assertEquals(receiver.committedCount(topic.name()), (2L * count))
+      receiver.committedCount(topic.name()) shouldBe (2L * count)
+    }
   }
-}
+})

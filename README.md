@@ -8,6 +8,7 @@ Module kotlin-kafka
 * [Goals](#goals)
 * [Adding Dependency](#adding-dependency)
 * [Example](#example)
+* [Running the tests](#running-the-tests)
 
 <!--- END -->
 
@@ -137,3 +138,22 @@ Key(index=8) -> Message(content=msg: 8)
 Key(index=9) -> Message(content=msg: 9)
 Key(index=10) -> Message(content=msg: 10)
 ```
+
+## Running the tests
+
+The tests run against a Kafka broker in [Testcontainers](https://java.testcontainers.org/), so they need a running
+Docker daemon. They are written with [Kotest](https://kotest.io/), on JDK 17 (Gradle provisions it if missing).
+
+```shell
+./gradlew test
+```
+
+Optional flags:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-Dkotest.spec.concurrency=N` | `1` | Run up to `N` specs at once (`0` unbounded). |
+| `-Dkotest.test.order=sequential\|random\|lexicographic` | `sequential` | Order of tests within a spec. |
+| `-PstressTest=N` | `1` | Run every `withTopic` test body `N` times, to shake out flakiness. |
+
+All specs share one broker. A spec that changes the broker itself (e.g. pausing it) must be annotated `@Isolate`.

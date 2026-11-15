@@ -3,11 +3,13 @@ package io.github.nomisrev.kafka.receiver
 import io.github.nomisRev.kafka.receiver.CommitStrategy
 import io.github.nomisRev.kafka.receiver.ReceiverSettings
 import io.github.nomisRev.kafka.receiver.internals.EventLoop
+import io.kotest.assertions.withClue
+import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.shouldBe
 import java.time.Duration as JavaDuration
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.test.assertNull
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -17,7 +19,6 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener
@@ -27,17 +28,14 @@ import org.apache.kafka.clients.consumer.MockConsumer
 import org.apache.kafka.clients.consumer.OffsetResetStrategy
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.StringDeserializer
-import org.junit.jupiter.api.Test
 
 /**
  * The event loop remembers the partitions the user had paused when it starts back pressuring, so
  * that it can leave them paused after a rebalance. A rebalance that takes those partitions away
  * has to survive that bookkeeping.
  */
-class RebalanceDuringBackPressureSpec {
-
-  @Test
-  fun `a rebalance that drops user paused partitions does not break the subscription`() = runBlocking {
+class RebalanceDuringBackPressureSpec : FunSpec({
+  test("a rebalance that drops user paused partitions does not break the subscription") {
     val rebalanceNow = AtomicBoolean(false)
     val backPressured = CompletableDeferred<Unit>()
     val secondBatchPolled = CompletableDeferred<Unit>()
@@ -127,11 +125,12 @@ class RebalanceDuringBackPressureSpec {
       releaseCollector.complete(Unit)
       val failure = withTimeoutOrNull(10.seconds) { flowFailure.await() }
 
-      assertNull(
-        failure,
+      withClue(
         "the rebalance must not fail the receive flow, but it failed with " +
           "${failure?.let { "${it::class.simpleName}: ${it.message}" }}"
-      )
+      ) {
+        failure shouldBe null
+      }
     } finally {
       collecting.cancelAndJoin()
       collectorScope.coroutineContext[Job]?.cancelAndJoin()
@@ -140,7 +139,7 @@ class RebalanceDuringBackPressureSpec {
       collectorDispatcher.close()
     }
   }
-}
+})
 
 private const val REPAUSE_TOPIC = "probe-topic"
 private val REPAUSE_PARTITIONS = listOf(0, 1, 2).map { TopicPartition(REPAUSE_TOPIC, it) }
