@@ -4,11 +4,11 @@ import org.gradle.api.tasks.testing.logging.TestLogEvent.FAILED
 import org.gradle.api.tasks.testing.logging.TestLogEvent.SKIPPED
 import org.gradle.api.tasks.testing.logging.TestLogEvent.STANDARD_ERROR
 import org.jetbrains.dokka.gradle.DokkaTask
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 
 plugins {
   alias(libs.plugins.kotlin.jvm)
-  alias(libs.plugins.kotlin.assert)
   alias(libs.plugins.dokka)
   alias(libs.plugins.spotless)
   alias(libs.plugins.knit)
@@ -26,24 +26,24 @@ dependencies {
   api(libs.kafka.clients)
   implementation(libs.slf4j.api)
 
-  testImplementation(kotlin("test"))
+  // Kotest's runner asks for an older JUnit 6.0.x; align every module with the launcher.
+  testImplementation(platform(libs.junit.bom))
+  testRuntimeOnly(libs.junit.platform.launcher)
+  testImplementation(libs.kotest.runner.junit6)
+  testImplementation(libs.kotest.assertions.core)
+  testImplementation(libs.kotest.extensions.testcontainers)
   testImplementation(libs.testcontainers.kafka)
   testImplementation(libs.slf4j.simple)
-  testImplementation(libs.kotlinx.coroutines.test)
-}
-
-@Suppress("OPT_IN_USAGE")
-powerAssert {
-  functions = listOf("kotlin.test.assertEquals")
 }
 
 configure<KnitPluginExtension> {
   siteRoot = "https://nomisrev.github.io/kotlin-kafka/"
 }
 
+// 17 for Kotest's JUnit 6 runner; the library still targets Java 8 (see compileKotlin/compileJava).
 configure<JavaPluginExtension> {
   toolchain {
-    languageVersion.set(JavaLanguageVersion.of(8))
+    languageVersion.set(JavaLanguageVersion.of(17))
   }
 }
 
@@ -78,11 +78,36 @@ tasks {
 
   getByName("knitPrepare").dependsOn(getTasksByName("dokka", true))
 
+  compileKotlin {
+    compilerOptions {
+      jvmTarget.set(JvmTarget.JVM_1_8)
+      freeCompilerArgs.add("-Xjdk-release=1.8")
+    }
+  }
+
+  compileJava {
+    options.release.set(8)
+  }
+
   withType<Test>().configureEach {
     useJUnitPlatform()
-    maxParallelForks = (2 * Runtime.getRuntime().availableProcessors())
+    // One test JVM shares one broker; spec concurrency is set in ProjectConfig.
     project.findProperty("stressTest")?.let { stressTest ->
       systemProperty("io.github.nomisrev.kafka.TEST_ITERATIONS", stressTest)
+    }
+
+    // A Gradle `-D` only reaches the daemon, not the test JVM.
+    fun forward(name: String, expected: String, valid: (String) -> Boolean) =
+      providers.systemProperty(name).orNull?.let {
+        require(valid(it)) { "-D$name must be $expected, was \"$it\"" }
+        systemProperty(name, it)
+      }
+
+    forward("kotest.spec.concurrency", "a non-negative integer (0 unbounded, 1 sequential)") {
+      (it.toIntOrNull() ?: -1) >= 0
+    }
+    forward("kotest.test.order", "one of sequential/random/lexicographic") {
+      it.lowercase() in setOf("sequential", "random", "lexicographic")
     }
     testLogging {
       exceptionFormat = FULL

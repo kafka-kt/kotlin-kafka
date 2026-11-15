@@ -1,55 +1,37 @@
 package io.github.nomisrev.kafka.receiver
 
 import io.github.nomisRev.kafka.receiver.CommitStrategy
-import kotlinx.coroutines.runBlocking
-import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.assertThrows
-import java.lang.IllegalArgumentException
-import kotlin.test.assertEquals
+import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.shouldBe
 import kotlin.time.Duration.Companion.seconds
 
-class CommitStrategySpec {
-  @Test
-  fun `Negative or zero sized BySize strategy fails`() = runBlocking<Unit> {
-    val actual = assertThrows<IllegalArgumentException> {
+class CommitStrategySpec : FunSpec({
+  test("Negative or zero sized BySize strategy fails") {
+    val actual = shouldThrow<IllegalArgumentException> {
       val _ = CommitStrategy.BySize(0)
     }.message
-    assertEquals(
-      "Size based auto-commit requires positive non-zero commit batch size but found 0",
-      actual
-    )
+    actual shouldBe "Size based auto-commit requires positive non-zero commit batch size but found 0"
   }
 
-  @Test
-  fun `Negative or zero sized BySizeOrTime strategy fails`() = runBlocking<Unit> {
-    val actual = assertThrows<IllegalArgumentException> {
+  test("Negative or zero sized BySizeOrTime strategy fails") {
+    val actual = shouldThrow<IllegalArgumentException> {
       val _ = CommitStrategy.BySizeOrTime(0, 1.seconds)
     }.message
-    assertEquals(
-      "Size based auto-commit requires positive non-zero commit batch size but found 0",
-      actual
-    )
+    actual shouldBe "Size based auto-commit requires positive non-zero commit batch size but found 0"
   }
 
-  @Test
-  fun `Negative or zero duration BySizeOrTime strategy fails`() = runBlocking<Unit> {
-    val actual = assertThrows<IllegalArgumentException> {
+  test("Negative or zero duration BySizeOrTime strategy fails") {
+    val actual = shouldThrow<IllegalArgumentException> {
       val _ = CommitStrategy.BySizeOrTime(1, 0.seconds)
     }.message
-    assertEquals(
-      "Time based auto-commit requires positive non-zero interval but found ${0.seconds}",
-      actual
-    )
+    actual shouldBe "Time based auto-commit requires positive non-zero interval but found ${0.seconds}"
   }
 
-  @Test
-  fun `Negative or zero duration ByTime strategy fails`() = runBlocking<Unit> {
-    val actual = assertThrows<IllegalArgumentException> {
+  test("Negative or zero duration ByTime strategy fails") {
+    val actual = shouldThrow<IllegalArgumentException> {
       val _ = CommitStrategy.ByTime(0.seconds)
     }.message
-    assertEquals(
-      "Time based auto-commit requires positive non-zero interval but found ${0.seconds}",
-      actual
-    )
+    actual shouldBe "Time based auto-commit requires positive non-zero interval but found ${0.seconds}"
   }
-}
+})

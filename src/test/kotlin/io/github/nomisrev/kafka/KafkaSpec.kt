@@ -2,6 +2,7 @@ package io.github.nomisrev.kafka
 
 import io.github.nomisRev.kafka.Admin
 import io.github.nomisRev.kafka.AdminSettings
+import io.github.nomisRev.kafka.await
 import io.github.nomisRev.kafka.createTopic
 import io.github.nomisRev.kafka.deleteTopic
 import io.github.nomisRev.kafka.describeTopic
@@ -13,16 +14,21 @@ import io.github.nomisRev.kafka.receiver.AutoOffsetReset
 import io.github.nomisRev.kafka.receiver.KafkaReceiver
 import io.github.nomisRev.kafka.receiver.ReceiverSettings
 import io.github.nomisrev.kafka.receiver.KeyValue
+import io.kotest.assertions.nondeterministic.until
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import org.apache.kafka.clients.admin.Admin
 import org.apache.kafka.clients.admin.AdminClientConfig
 import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata
+import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.consumer.OffsetAndMetadata
 import org.apache.kafka.clients.producer.Callback
 import org.apache.kafka.clients.producer.KafkaProducer
@@ -34,12 +40,13 @@ import org.apache.kafka.common.Metric
 import org.apache.kafka.common.MetricName
 import org.apache.kafka.common.PartitionInfo
 import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.TopicPartitionReplica
 import org.apache.kafka.common.Uuid
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.serialization.StringSerializer
-import org.junit.jupiter.api.AfterAll
-import org.junit.jupiter.api.BeforeAll
-import org.junit.jupiter.api.TestInstance
+import io.kotest.core.extensions.install
+import io.kotest.core.spec.style.FunSpec
+import io.kotest.matchers.shouldBe
 import java.time.Duration
 import java.util.Properties
 import java.util.UUID
@@ -47,76 +54,51 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import kotlin.test.assertEquals
-import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 private val testIterations: Int =
   System.getProperties().getProperty("io.github.nomisrev.kafka.TEST_ITERATIONS")?.toIntOrNull() ?: 1
 
-@TestInstance(TestInstance.Lifecycle.PER_CLASS)
-abstract class KafkaSpec {
+private val consumerPollingTimeout = 1.seconds
 
-  companion object {
-    private val consumerPollingTimeout = 1.seconds
-    private val transactionTimeoutInterval = 1.seconds
+/** The old `runTest` timeout. */
+private val topicTestTimeout = 1.minutes
 
-    @AfterAll
-    @JvmStatic
-    fun destroy() {
-      kafka.stop()
-    }
+/** Specs may run concurrently, so each [withTopic] gets its own topic and consumer group. */
+abstract class KafkaSpec(body: KafkaSpec.() -> Unit) : FunSpec() {
 
-    @BeforeAll
-    @JvmStatic
-    fun setup() {
-      kafka.start()
-    }
+  val kafka: Kafka = install(KafkaContainer.extension)
 
-    @JvmStatic
-    val kafka: Kafka =
-      Kafka().apply {
-        withExposedPorts(9092, 9093)
-        withNetworkAliases("broker")
-        withEnv("KAFKA_HOST_NAME", "broker")
-        withEnv("KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR", "1")
-        withEnv("KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR", "1")
-        withEnv(
-          "KAFKA_TRANSACTION_ABORT_TIMED_OUT_TRANSACTION_CLEANUP_INTERVAL_MS",
-          transactionTimeoutInterval.inWholeMilliseconds.toString()
-        )
-        withEnv("KAFKA_AUTHORIZER_CLASS_NAME", "kafka.security.authorizer.AclAuthorizer")
-        withEnv("KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND", "true")
-        withReuse(true)
-      }
+  private fun groupId(topic: NewTopic): String =
+    "group-${topic.name()}"
 
-    fun KafkaReceiver(): KafkaReceiver<String, String> =
-      KafkaReceiver(receiverSetting())
+  fun KafkaReceiver(topic: NewTopic): KafkaReceiver<String, String> =
+    KafkaReceiver(receiverSetting(topic))
 
-    fun receiverSetting(): ReceiverSettings<String, String> =
-      ReceiverSettings(
-        bootstrapServers = kafka.bootstrapServers,
-        keyDeserializer = StringDeserializer(),
-        valueDeserializer = StringDeserializer(),
-        groupId = "test-group-id",
-        autoOffsetReset = AutoOffsetReset.Earliest,
-        pollTimeout = consumerPollingTimeout
-      )
-
-    fun publisherSettings() = PublisherSettings(
+  fun receiverSetting(topic: NewTopic): ReceiverSettings<String, String> =
+    ReceiverSettings(
       bootstrapServers = kafka.bootstrapServers,
-      keySerializer = StringSerializer(),
-      valueSerializer = StringSerializer(),
-      properties = Properties().apply {
-        put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 10000.toString())
-        put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 1000.toString())
-      }
+      keyDeserializer = StringDeserializer(),
+      valueDeserializer = StringDeserializer(),
+      groupId = groupId(topic),
+      autoOffsetReset = AutoOffsetReset.Earliest,
+      pollTimeout = consumerPollingTimeout
     )
 
-    @IgnorableReturnValue
-    suspend fun <A> publishScope(block: suspend TransactionalScope<String, String>.() -> A): A =
-      KafkaPublisher(publisherSettings()).use { it.publishScope(block) }
-  }
+  fun publisherSettings() = PublisherSettings(
+    bootstrapServers = kafka.bootstrapServers,
+    keySerializer = StringSerializer(),
+    valueSerializer = StringSerializer(),
+    properties = Properties().apply {
+      put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 10000.toString())
+      put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 1000.toString())
+    }
+  )
+
+  @IgnorableReturnValue
+  suspend fun <A> publishScope(block: suspend TransactionalScope<String, String>.() -> A): A =
+    KafkaPublisher(publisherSettings()).use { it.publishScope(block) }
 
   private fun adminProperties(): Properties = Properties().apply {
     put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.bootstrapServers)
@@ -152,10 +134,16 @@ abstract class KafkaSpec {
   private fun nextTopicName(): String =
     "topic-${UUID.randomUUID()}"
 
-  class TopicTestScope(
+  inner class TopicTestScope(
     val topic: NewTopic,
     scope: CoroutineScope
   ) : CoroutineScope by scope {
+    fun KafkaReceiver(): KafkaReceiver<String, String> =
+      KafkaReceiver(topic)
+
+    fun receiverSetting(): ReceiverSettings<String, String> =
+      receiverSetting(topic)
+
     fun produce(count: Int): List<ProducerRecord<String, String>> =
       produce(0 until count)
 
@@ -168,18 +156,19 @@ abstract class KafkaSpec {
     }
   }
 
-  fun withTopic(
+  suspend fun withTopic(
     topicConfig: Map<String, String> = emptyMap(),
     partitions: Int = 4,
     replicationFactor: Short = 1,
     test: suspend TopicTestScope.(NewTopic) -> Unit
   ): Unit = repeat(testIterations) {
-    runTest {
+    withTimeout(topicTestTimeout) {
       val topic = NewTopic(nextTopicName(), partitions, replicationFactor).configs(topicConfig)
       admin {
         createTopic(topic)
+        awaitLeaders(topic)
         try {
-          TopicTestScope(topic, this@runTest).test(topic)
+          TopicTestScope(topic, this@withTimeout).test(topic)
         } finally {
           topic.shouldBeEmpty()
           deleteTopic(topic.name())
@@ -188,10 +177,19 @@ abstract class KafkaSpec {
     }
   }
 
-  @Suppress("ObjectInheritsException", "unused")
-  object Boom : RuntimeException("Boom!") {
-    private fun readResolve(): Any = Boom
-  }
+  /**
+   * KRaft's `createTopic` returns before the broker hosts the partitions, and an idempotent producer retrying
+   * through `NOT_LEADER_OR_FOLLOWER` can loop forever on `OutOfOrderSequenceException`. A leader in `describeTopic`
+   * appears too early, so wait for the replica log.
+   */
+  private suspend fun Admin.awaitLeaders(topic: NewTopic): Unit =
+    until(10.seconds) {
+      val leaders = describeTopic(topic.name())?.partitions()?.map { partition ->
+        partition.leader()?.let { TopicPartitionReplica(topic.name(), partition.partition(), it.id()) }
+      }
+      if (leaders == null || leaders.any { it == null }) false
+      else describeReplicaLogDirs(leaders.filterNotNull()).all().await().values.all { it.currentReplicaLogDir != null }
+    }
 
   @JvmName("publishPairsToKafka")
   suspend fun publishToKafka(
@@ -224,43 +222,59 @@ abstract class KafkaSpec {
       }
     }
 
+  /**
+   * Fails on any record past the group's committed offsets. Reads up to the end offsets, not for a time window, which
+   * would pass on a slow group join. `assign` so the group is never joined or rebalanced.
+   */
   suspend fun NewTopic.shouldBeEmpty() {
-    val res = withTimeoutOrNull(100.milliseconds) {
-      KafkaReceiver()
-        .receive(name())
-        .take(1)
-        .toList()
+    val consumerProperties = Properties().apply {
+      put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.bootstrapServers)
+      put(ConsumerConfig.GROUP_ID_CONFIG, groupId(this@shouldBeEmpty))
+      put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed")
+      put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false")
     }
-    if (res != null) throw AssertionError("Expected test to timeout, but found $res")
+    val unconsumed = withContext(Dispatchers.IO) {
+      KafkaConsumer(consumerProperties, StringDeserializer(), StringDeserializer()).use { consumer ->
+        val partitions = consumer.partitionsFor(name()).map { TopicPartition(it.topic(), it.partition()) }
+        consumer.assign(partitions)
+        val committed = consumer.committed(partitions.toSet())
+        partitions.forEach { partition ->
+          committed[partition]?.let { consumer.seek(partition, it.offset()) }
+            ?: consumer.seekToBeginning(listOf(partition))
+        }
+        val end = consumer.endOffsets(partitions)
+        val found = mutableListOf<ConsumerRecord<String, String>>()
+        until(10.seconds) {
+          found += consumer.poll(Duration.ofMillis(100))
+          partitions.all { consumer.position(it) >= end.getValue(it) }
+        }
+        found
+      }
+    }
+    if (unconsumed.isNotEmpty()) throw AssertionError("Expected no unconsumed records, but found $unconsumed")
   }
 
   suspend infix fun NewTopic.assertHasRecord(records: ProducerRecord<String, String>) {
-    assertEquals(
-      KafkaReceiver()
-        .receive(name())
-        .map {
-          it.apply { offset.acknowledge() }
-        }.take(1)
-        .map { it.value() }
-        .toList(),
-      listOf(records.value())
-    )
+    KafkaReceiver(this)
+      .receive(name())
+      .map {
+        it.apply { offset.acknowledge() }
+      }.take(1)
+      .map { it.value() }
+      .toList() shouldBe listOf(records.value())
     shouldBeEmpty()
   }
 
   suspend infix fun NewTopic.assertHasRecords(records: Iterable<ProducerRecord<String, String>>) {
-    assertEquals(
-      KafkaReceiver()
-        .receive(name())
-        .map { record ->
-          record
-            .also { record.offset.acknowledge() }
-        }
-        .take(records.toList().size)
-        .toList()
-        .groupBy({ it.partition() }) { it.value() },
-      records.groupBy({ it.partition() }) { it.value() }
-    )
+    KafkaReceiver(this)
+      .receive(name())
+      .map { record ->
+        record
+          .also { record.offset.acknowledge() }
+      }
+      .take(records.toList().size)
+      .toList()
+      .groupBy({ it.partition() }) { it.value() } shouldBe records.groupBy({ it.partition() }) { it.value() }
     shouldBeEmpty()
   }
 
@@ -270,18 +284,15 @@ abstract class KafkaSpec {
   ) {
     val expected =
       records.flatten().groupBy({ it.partition() }) { it.value() }.mapValues { it.value.toSet() }
-    assertEquals(
-      KafkaReceiver()
-        .receive(name())
-        .map { record ->
-          record.also { record.offset.acknowledge() }
-        }
-        .take(records.flatten().size)
-        .toList()
-        .groupBy({ it.partition() }) { it.value() }
-        .mapValues { it.value.toSet() },
-      expected
-    )
+    KafkaReceiver(this)
+      .receive(name())
+      .map { record ->
+        record.also { record.offset.acknowledge() }
+      }
+      .take(records.flatten().size)
+      .toList()
+      .groupBy({ it.partition() }) { it.value() }
+      .mapValues { it.value.toSet() } shouldBe expected
     shouldBeEmpty()
   }
 
@@ -348,4 +359,13 @@ abstract class KafkaSpec {
       }
     }
   //</editor-fold>
+
+  init {
+    body()
+  }
+}
+
+@Suppress("ObjectInheritsException", "unused")
+object Boom : RuntimeException("Boom!") {
+  private fun readResolve(): Any = Boom
 }
